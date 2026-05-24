@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 """
-Klasifikator napona s jednim LightGBM modelom i Mahalanobis detekcijom anomalija.
+Klasifikator napona s jednim LightGBM modelom.
 
-Multi-view arhitektura: Raw + MinMax + Log + Diff -> 960 znacajki,
-plus Mahalanobis udaljenost po klasi za detekciju anomalija.
+Multi-view arhitektura: Raw + MinMax + Log + Diff -> 960 znacajki.
 
-6 klasa: 3v, 6v, 9v, 12v, 15v, 18v  (+zastavica anomalije)
+6 klasa: 3v, 6v, 9v, 12v, 15v, 18v
 """
 
 import json, os, sys, time
 import numpy as np
 from collections import OrderedDict
 from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
 from sklearn.utils.class_weight import compute_sample_weight
 import lightgbm as lgb
 
@@ -24,9 +22,6 @@ N_AUGMENT      = 5
 
 LGB_ROUNDS     = 600
 LGB_EARLY_STOP = 50
-N_PCA          = 50          # komponente za Mahalanobis
-ANOMALY_PERCENTILE = 99      # percentil udaljenosti za prag anomalije
-MIN_CONFIDENCE = 0.4         # ispod ovoga -> anomalija bez obzira na udaljenost
 
 ROOT       = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR   = os.path.join(os.path.dirname(ROOT), 'training_data')
@@ -351,62 +346,6 @@ def main():
         tocnost_klase = (predikcije[maska].argmax(1) == indeks_klase).mean()
         print(f"{klasa}: {tocnost_klase:.4f}")
 
-    # -- 4b. Mahalanobis detekcija anomalija (na ne-augmentiranom treningu) --
-    print("\n[4b/5] Racunanje statistike za Mahalanobis detekciju anomalija ...")
-
-    # multi-view znacajke iz ne-augmentiranih trening prozora
-    X_train_mv_cisti = build_multiview_features(X_train_seq, skalar, log_skalar)
-
-    # PCA - analiza glavnih komponenti za smanjenje dimenzionalnosti (960 -> N_PCA)
-    pca = PCA(n_components=N_PCA, random_state=SEED)
-    X_pca = pca.fit_transform(X_train_mv_cisti)
-    print(f"PCA smanjio {X_train_mv_cisti.shape[1]} znacajki na {N_PCA}," 
-          f" zadrzano {pca.explained_variance_ratio_.sum():.2%} informacije")
-
-    # srednja vrijednost po klasi u PCA prostoru
-    srednje_vrijednosti_klasa = {}
-    uzorci_klasa = {}
-    for indeks_klase, klasa in enumerate(CLASSES):
-        maska = y_train == indeks_klase
-        pca_klase = X_pca[maska]
-        srednje_vrijednosti_klasa[klasa] = pca_klase.mean(axis=0)
-        uzorci_klasa[klasa] = pca_klase
-
-    # dijeljena povezanosti znacajki iz svih trening podataka
-    matrica_povezanost_znacajki = np.cov(X_pca, rowvar=False)
-    # regularizacija za osiguranje inverzije
-    matrica_povezanost_znacajki += np.eye(N_PCA) * 1e-6
-    matrica_preciznosti = np.linalg.inv(matrica_povezanost_znacajki)
-
-    # Mahalanobis udaljenost svakog trening uzorka do vlastite klase
-    print("Pragove udaljenosti iz trening podataka ...")
-    pragovi_klasa = {}
-    for indeks_klase, klasa in enumerate(CLASSES):
-        uzorci_pca = uzorci_klasa[klasa]
-        razlika = uzorci_pca - srednje_vrijednosti_klasa[klasa]
-        # Mahalanobis: sqrt((x-mu)^T @ preciznost @ (x-mu)) @ - mnozenje matrica 
-        udaljenosti = np.sqrt(np.sum(razlika @ matrica_preciznosti * razlika, axis=1))
-        prag = np.percentile(udaljenosti, ANOMALY_PERCENTILE)
-        srednja_udaljenost = udaljenosti.mean()
-        std_udaljenosti = udaljenosti.std()
-        pragovi_klasa[klasa] = float(prag)
-        print(f"{klasa}: srednja_udaljenost={srednja_udaljenost:.2f}, std={std_udaljenosti:.2f}, "
-              f"p{ANOMALY_PERCENTILE} prag={prag:.2f}")
-
-    # provjera tocnosti s detekcijom anomalija na test skupu
-    X_test_pca = pca.transform(X_test_mv)
-    broj_anomalija_test = 0
-    for i in range(len(X_test_pca)):
-        indeks_predikcije = int(predikcije[i].argmax())
-        klasa_predikcije = CLASSES[indeks_predikcije]
-        razlika = X_test_pca[i] - srednje_vrijednosti_klasa[klasa_predikcije]
-        udaljenost = np.sqrt(razlika @ matrica_preciznosti @ razlika)
-        pouzdanost = float(predikcije[i].max())
-        if udaljenost > pragovi_klasa[klasa_predikcije] or pouzdanost < MIN_CONFIDENCE:
-            broj_anomalija_test += 1
-    print(f"Test uzorci oznaceni kao anomalija: {broj_anomalija_test}/{len(X_test_pca)} "
-          f"({broj_anomalija_test/len(X_test_pca):.1%})")
-
     # -- 5. Izvoz modela i konfiguracije -----------------------------------
     print("\n[5/5] Spremanje modela ...")
 
@@ -437,17 +376,6 @@ def main():
         'n_features_per_view': N_TOTAL * 5,
         'n_lgb_features': N_TOTAL * 5 * 4,
         'test_accuracy': float(tocnost),
-        # parametri detekcije anomalija
-        'anomaly_detection': {
-            'n_pca_components': N_PCA,
-            'pca_components': pca.components_.tolist(),
-            'pca_mean': pca.mean_.tolist(),
-            'precision_matrix': matrica_preciznosti.tolist(),
-            'class_means_pca': {klasa: srednje_vrijednosti_klasa[klasa].tolist() for klasa in CLASSES},
-            'class_thresholds': pragovi_klasa,
-            'min_confidence': MIN_CONFIDENCE,
-            'anomaly_percentile': ANOMALY_PERCENTILE,
-        },
     }
     putanja_konfiguracije = os.path.join(MODEL_DIR, 'model_config.json')
     with open(putanja_konfiguracije, 'w') as datoteka:
@@ -461,11 +389,6 @@ def main():
     print(f"Tocnost LightGBM-a na test skupu: {tocnost:.4f}")
     print(f"Pogledi: {nazivi_pogleda}")
     print(f"Ukupno znacajki: {X_train_mv.shape[1]}")
-    print(f"Detekcija anomalija: PCA({N_PCA}), Mahalanobis, "
-          f"min_pouzdanost={MIN_CONFIDENCE}")
-    print(f"Pragovi anomalija (p{ANOMALY_PERCENTILE}):")
-    for klasa in CLASSES:
-        print(f"{klasa}: {pragovi_klasa[klasa]:.2f}")
     print(f"\nDatoteke spremljene u: {MODEL_DIR}")
     print("=" * 70)
 
