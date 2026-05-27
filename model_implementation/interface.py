@@ -63,18 +63,6 @@ class VoltageFaultPredictor:
         fault_model_path = os.path.join(model_dir, fault_model_file)
         self.fault_model = lgb.Booster(model_file=fault_model_path)
 
-        # parametri PCA + Mahalanobis detekcije anomalija za voltage klasifikator
-        anomaly_cfg = self.voltage_cfg['anomaly_detection']
-        self.pca_components = np.array(anomaly_cfg['pca_components'], dtype=np.float32)
-        self.pca_mean = np.array(anomaly_cfg['pca_mean'], dtype=np.float32)
-        self.class_means_pca = {
-            klasa: np.array(vrijednost, dtype=np.float32)
-            for klasa, vrijednost in anomaly_cfg['class_means_pca'].items()
-        }
-        self.precision_matrix = np.array(anomaly_cfg['precision_matrix'], dtype=np.float32)
-        self.class_thresholds = {k: float(v) for k, v in anomaly_cfg['class_thresholds'].items()}
-        self.min_confidence = float(anomaly_cfg['min_confidence'])
-
         self.buffer = []
 
         # klizajuci spremnik osnove za detekciju skokova ovisnu o kontekstu.
@@ -305,24 +293,6 @@ class VoltageFaultPredictor:
 
         return is_spike, confidence, detail
 
-    def _check_anomaly(self, voltage_features_flat, voltage_class, voltage_conf):
-        """
-        Detekcija anomalije za predvidenu naponsku klasu.
-        Projektira 960-D vektor u PCA prostor, racuna Mahalanobis udaljenost
-        do sredine predvidene klase, usporeduje s pragom te klase.
-
-        Vraca (is_anomaly, mahalanobis_dist, threshold).
-        """
-        # projekcija u PCA prostor: (x - mean) @ components^T
-        pca_x = (voltage_features_flat - self.pca_mean) @ self.pca_components.T
-        razlika = pca_x - self.class_means_pca[voltage_class]
-        udaljenost = float(np.sqrt(razlika @ self.precision_matrix @ razlika))
-        prag = self.class_thresholds[voltage_class]
-
-        # anomalija ako je predaleko od centra klase ILI ako je pouzdanost preniska
-        is_anomaly = (udaljenost > prag) or (voltage_conf < self.min_confidence)
-        return is_anomaly, udaljenost, prag
-
     def predict(self, window_np):
         # Faza 1: klasifikacija napona
         voltage_features = self._build_multiview(
@@ -334,11 +304,6 @@ class VoltageFaultPredictor:
         voltage_idx = int(np.argmax(voltage_probs))
         voltage_conf = float(voltage_probs[voltage_idx])
         voltage_class = self.voltage_classes[voltage_idx]
-
-        # Faza 1b: detekcija anomalije nad predvidenom naponskom klasom
-        is_anomaly, mahalanobis_dist, anomaly_threshold = self._check_anomaly(
-            voltage_features[0], voltage_class, voltage_conf
-        )
 
         # Faza 2a: prvo radimo ML detekciju kvara
         fault_features = self._build_multiview(
@@ -377,9 +342,6 @@ class VoltageFaultPredictor:
             'spike_confidence': float(spike_conf),
             'spike_detail': spike_detail,
             'spike_overridden_by_ml': bool(is_spike and ml_strong_fault),
-            'is_anomaly': is_anomaly,
-            'mahalanobis_dist': mahalanobis_dist,
-            'anomaly_threshold': anomaly_threshold,
         }
 
         return voltage_class, voltage_conf, fault_status, fault_conf, detail
@@ -491,15 +453,9 @@ def run_live_test(args):
                           f"outliers={sd['within_window_outliers']}, "
                           f"jump={sd['max_jump_features']}/{sd['n_features_checked']}")
 
-        anomaly_info = ""
-        if detail.get('is_anomaly'):
-            anomaly_info = (f"  {Y}ANOMALY{RST} "
-                            f"dist={detail['mahalanobis_dist']:.2f}>"
-                            f"thr={detail['anomaly_threshold']:.2f}")
-
         print(f"\n[{time.strftime('%H:%M:%S')}] Sample #{sample_num}  "
               f"v_rms={data.get('v_rms_magnitude','?')}")
-        print(f"Voltage: {G if v_ok else R}{voltage:5s}{RST} conf={v_conf:.3f} acc={v_acc}{anomaly_info}")
+        print(f"Voltage: {G if v_ok else R}{voltage:5s}{RST} conf={v_conf:.3f} acc={v_acc}")
         print(f"Fault: {G if f_ok else R}{fault:15s}{RST} conf={f_conf:.3f} acc={f_acc}{spike_info}")
 
     # -- Replay nacin -----------------------------------------------------
