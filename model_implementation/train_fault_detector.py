@@ -6,7 +6,8 @@ Iste multi-view znacajke kao voltage klasifikator:
   Raw + MinMax + Log + Diff -> 960 znacajki
 
 3 klase: normal, fan_imbalance, movement
-Naponski skokovi detektirani pravilima (samo 5 uzoraka za kalibraciju).
+Naponske skokove pri radu uzivo prepoznaje skup pravila (interface.py),
+ne ovaj model — nije zasebna klasa.
 """
 
 import json, os
@@ -83,7 +84,6 @@ RATIO_DEFS = [
 ]
 
 RATIO_NAMES = [r[0] for r in RATIO_DEFS]
-ALL_FEATURE_NAMES = RAW_FEATURES + RATIO_NAMES
 N_RAW   = len(RAW_FEATURES)
 N_RATIO = len(RATIO_DEFS)
 N_TOTAL = N_RAW + N_RATIO
@@ -261,20 +261,39 @@ def build_multiview_features(sirovi_prozori, skalar, log_skalar):
     return np.hstack([statistike_sirovih, statistike_minmax, statistike_loga, statistike_razlike])
 
 
-# -- Analiza naponskih skokova ---------------------------------------------
+# -- Postavke detektora naponskih skokova ---------------------------------
+# Radni pragovi pravila za prepoznavanje skokova koja se izvrsavaju u
+# interface.py. Vrijednosti su pronadene rucno, kroz testiranje tijekom razvoja. 
+# Spremaju se u # fault_config.json kako bi se mogle mijenjati bez 
+# diranja koda koji ih koristi.
+OPERATIONAL_THRESHOLDS = {
+    # Strategija A (MAD - kratki odskoci unutar prozora)
+    'mad_zscore_threshold': 5.0,
+    # Strategija B (nagli skok vise znacajki odjednom)
+    'rel_change_threshold': 2.5,
+    # Strategija C (odstupanje od klizajuce osnove)
+    'baseline_zscore_threshold': 6.0,
+    # Strategija D (rampa v_rms-a unutar prozora)
+    'v_rms_gate': 0.2,
+    'ramp_ratio_threshold': 0.25,
+    # Klizajuci spremnik
+    'baseline_min_samples': 20,
+    'baseline_buffer_size': 50,
+    # Stanka nakon brisanja prediktivnog spremnika zbog skoka
+    'spike_cooldown_samples': 20,
+    # Nadjacaj prepoznavanje skoka ako ML model jako sigurno predvidi imbalance/movement
+    'ml_strong_fault_confidence': 0.75,
+}
+
+
+# -- Analiza naponskih skokova --------------------------------------------
 def analyze_voltage_spikes(podaci_skokova):
     """
-    Analiza 5 uzoraka naponskih skokova za kalibraciju pragova.
-    Skokovi su kratki dogadaji s visokim peak-peak i niskim a_rms.
-
-    Vraca pragove za detekciju skokova pravilima.
+    Analiza uzoraka naponskih skokova za izracun referentnih brojki.
+    Skokovi su kratki dogadaji s visokim peak-peak vrijednostima.
     """
     if len(podaci_skokova) == 0:
-        return {
-            'a_rms_baseline_threshold': 0.15,
-            'peak_peak_jump_threshold': 1.0,
-            'note': 'No spike data available',
-        }
+        return {'note': 'No spike data available'}
 
     # a_rms_magnitude je znacajka na indeksu 11 u RAW_FEATURES
     indeks_a_rms = 11
@@ -289,7 +308,7 @@ def analyze_voltage_spikes(podaci_skokova):
     vrijednosti_pp = np.column_stack([pp_x, pp_y, pp_z])
 
     # razlike izmedu uzoraka - pokazuje koliko se naglo mijenja signal
-    razlike_pp = np.abs(np.diff(vrijednosti_pp, axis=0))  # (4, 3)
+    razlike_pp = np.abs(np.diff(vrijednosti_pp, axis=0))
     maksimalni_skok_pp = np.max(razlike_pp)
     srednji_skok_pp = np.mean(razlike_pp)
 
@@ -297,8 +316,6 @@ def analyze_voltage_spikes(podaci_skokova):
     pp_max = np.max(vrijednosti_pp)
 
     pragovi = {
-        'a_rms_baseline_threshold': float(min(0.15, srednja_a_rms * 2.0)),  # 2x srednja_a_rms ili 0.15
-        'peak_peak_jump_threshold': float(srednji_skok_pp * 1.5),
         'a_rms_mean': float(srednja_a_rms),
         'a_rms_std': float(std_a_rms),
         'pp_min': float(pp_min),
@@ -318,37 +335,37 @@ def main():
     print("=" * 70)
     print("Multi-View LightGBM detektor kvarova")
     print("Klase: normal, fan_imbalance, movement")
-    print("Naponski skokovi: detekcija pravilima (5 uzoraka za kalibraciju)")
+    print("Naponski skokovi: prepoznaju ih pravila u interface.py pri radu uzivo")
     print("=" * 70)
 
     # -- 1. Ucitavanje podataka -------------------------------------------
-    print("\n[1/7] Ucitavanje podataka ...")
+    print("\n[1/5] Ucitavanje podataka ...")
     normalni_podaci = load_normal_data()
     print(f"Ukupno normalnih uzoraka: {len(normalni_podaci)}")
 
     podaci_kvarova = load_fault_data()
 
-    # voltage_spike se ne trenira kao klasa - samo za kalibraciju pragova
+    # voltage_spike se ne trenira kao klasa - prijelazni je dogadaj, ne stabilno stanje.
+    # Skokovi se prepoznaju pravilima pri radu uzivo.
+    # Sami uzorci skokova ipak sluze za izracun referentnih brojki koje su
+    # spremljene u postavkama detektora.
     podaci_skokova = podaci_kvarova.pop('voltage_spike', np.array([]))
-    print(f"Naponski skokovi (za kalibraciju): {len(podaci_skokova)}")
+    print(f"Naponski skokovi (referentne brojke): {len(podaci_skokova)}")
 
     if len(normalni_podaci) == 0:
         print("ERROR: Nisu ucitani normalni podaci")
         return
 
-    # -- 2. Analiza naponskih skokova ------------------------------------
-    print("\n[2/7] Analiza uzoraka naponskih skokova ...")
+    # -- 1b. Analiza naponskih skokova ------------------------------------
+    print("\nAnaliza uzoraka naponskih skokova ...")
     pragovi_skokova = analyze_voltage_spikes(podaci_skokova)
     print(f"Karakteristike naponskih skokova (iz {len(podaci_skokova)} uzoraka):")
     print(f"a_rms osnova: {pragovi_skokova['a_rms_mean']:.4f} ± {pragovi_skokova['a_rms_std']:.4f}")
     print(f"peak_peak raspon: {pragovi_skokova['pp_min']:.4f} - {pragovi_skokova['pp_max']:.4f}")
     print(f"peak_peak skokovi: mean={pragovi_skokova['pp_jump_mean']:.4f}, max={pragovi_skokova['pp_jump_max']:.4f}")
-    print(f"Pragovi za detekciju skokova pravilima:")
-    print(f"a_rms prag osnove: {pragovi_skokova['a_rms_baseline_threshold']:.4f}")
-    print(f"peak_peak skok prag: {pragovi_skokova['peak_peak_jump_threshold']:.4f}")
 
-    # -- 3. Podjela na train/test i kreiranje prozora ---------------------
-    print("\n[3/7] Kreiranje train/test podjele i prozora ...")
+    # -- 2. Podjela na train/test i kreiranje prozora ---------------------
+    print("\n[2/5] Kreiranje train/test podjele i prozora ...")
     lista_trening_prozora, lista_trening_oznaka = [], []
     lista_test_prozora, lista_test_oznaka = [], []
 
@@ -409,7 +426,7 @@ def main():
     log_skalar.fit(log_trening.reshape(-1, N_TOTAL))
 
     # -- 4. Augmentacija i izgradnja multi-view znacajki ------------------
-    print("\n[4/7] Augmentiranje i gradnja multi-view znacajki ...")
+    print("\n[3/5] Augmentiranje i gradnja multi-view znacajki ...")
     rng_augmentacija = np.random.RandomState(SEED)
     X_train_aug, y_train_aug = augment_windows(
         X_train_seq, y_train, N_AUGMENT, rng_augmentacija, scale_range=(0.85, 1.15))
@@ -421,7 +438,7 @@ def main():
     X_test_mv = build_multiview_features(X_test_seq, skalar, log_skalar)
 
     # -- 5. Treniranje LightGBM modela ------------------------------------
-    print(f"\n[5/7] Treniranje 3-klasnog LightGBM ({X_train_mv.shape[1]} znacajki) ...")
+    print(f"\n[4/5] Treniranje 3-klasnog LightGBM ({X_train_mv.shape[1]} znacajki) ...")
 
     tezine_uzoraka = compute_sample_weight('balanced', y_train_aug)
 
@@ -465,8 +482,8 @@ def main():
             tocnost_klase = (predikcije[maska].argmax(1) == indeks_klase).mean()
             print(f"{klasa}: {tocnost_klase:.4f} ({maska.sum()} uzoraka)")
 
-    # -- 6. Izvoz modela i konfiguracije ----------------------------------
-    print("\n[6/7] Spremanje modela ...")
+    # -- 6. Izvoz modela i postavki ---------------------------------------
+    print("\n[5/5] Spremanje modela ...")
 
     putanja_modela = os.path.join(MODEL_DIR, 'fault_lightgbm.txt')
     model.save_model(putanja_modela)
@@ -495,7 +512,10 @@ def main():
         'n_features_per_view': N_TOTAL * 5,
         'n_lgb_features': N_TOTAL * 5 * 4,
         'test_accuracy': float(tocnost),
-        'voltage_spike_thresholds': pragovi_skokova,
+        'spike_detection': {
+            'data_derived': pragovi_skokova,
+            'operational_thresholds': OPERATIONAL_THRESHOLDS,
+        },
     }
 
     putanja_konfiguracije = os.path.join(MODEL_DIR, 'fault_config.json')
@@ -510,7 +530,7 @@ def main():
     print(f"Tocnost LightGBM-a na test skupu: {tocnost:.4f}")
     print(f"Pogledi: {nazivi_pogleda}")
     print(f"Ukupno znacajki: {X_train_mv.shape[1]}")
-    print(f"Naponski skokovi: detekcija pravilima ")
+    print(f"Naponski skokovi: detekcija pravilima u interface.py")
     print(f"\nDatoteke spremljene u: {MODEL_DIR}")
     print("=" * 70)
 

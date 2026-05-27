@@ -7,7 +7,7 @@ Multi-view arhitektura: Raw + MinMax + Log + Diff -> 960 znacajki.
 6 klasa: 3v, 6v, 9v, 12v, 15v, 18v
 """
 
-import json, os, sys, time
+import json, os
 import numpy as np
 from collections import OrderedDict
 from sklearn.preprocessing import StandardScaler
@@ -26,8 +26,6 @@ LGB_EARLY_STOP = 50
 ROOT       = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR   = os.path.join(os.path.dirname(ROOT), 'training_data')
 MODEL_DIR  = ROOT
-
-rng = np.random.RandomState(SEED)
 
 FILES = OrderedDict([
     ('3v',  ['3v_home_data.json']),
@@ -75,7 +73,6 @@ RATIO_DEFS = [
 ]
 
 RATIO_NAMES = [r[0] for r in RATIO_DEFS]
-ALL_FEATURE_NAMES = RAW_FEATURES + RATIO_NAMES
 N_RAW   = len(RAW_FEATURES)
 N_RATIO = len(RATIO_DEFS)
 N_TOTAL = N_RAW + N_RATIO
@@ -127,7 +124,7 @@ def minmax_normalize_windows(prozor):
 
 
 def log_transform_windows(prozor):
-    """Log1p transformacija s ouvanjem predznaka."""
+    """Log1p transformacija s ocuvanjem predznaka."""
     return np.sign(prozor) * np.log1p(np.abs(prozor))
 
 
@@ -391,13 +388,6 @@ def main():
     print(f"Ukupno znacajki: {X_train_mv.shape[1]}")
     print(f"\nDatoteke spremljene u: {MODEL_DIR}")
     print("=" * 70)
-
-    # brisanje starih datoteka trojnog modela ako postoje
-    for stara_datoteka in ['fan_lightgbm_raw.txt', 'fan_lightgbm_norm.txt',
-                           'fan_lightgbm_log.txt']:
-        stara_putanja = os.path.join(MODEL_DIR, stara_datoteka)
-        if os.path.exists(stara_putanja):
-            os.remove(stara_putanja)
 
 
 if __name__ == '__main__':

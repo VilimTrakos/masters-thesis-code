@@ -356,15 +356,26 @@
   "n_features_per_view": 240,
   "n_lgb_features": 960,
   "test_accuracy": 1.0,
-  "voltage_spike_thresholds": {
-    "a_rms_baseline_threshold": 0.15,
-    "peak_peak_jump_threshold": 1.9855127334594727,
-    "a_rms_mean": 0.17635026574134827,
-    "a_rms_std": 0.11561981588602066,
-    "pp_min": 1.2206361293792725,
-    "pp_max": 13.071353912353516,
-    "pp_jump_mean": 1.3236751556396484,
-    "pp_jump_max": 7.576433181762695,
-    "note": "Calibrated from 464 voltage spike samples"
+  "spike_detection": {
+    "data_derived": {
+      "a_rms_mean": 0.17635026574134827,
+      "a_rms_std": 0.11561981588602066,
+      "pp_min": 1.2206361293792725,
+      "pp_max": 13.071353912353516,
+      "pp_jump_mean": 1.3236751556396484,
+      "pp_jump_max": 7.576433181762695,
+      "note": "Calibrated from 464 voltage spike samples"
+    },
+    "operational_thresholds": {
+      "mad_zscore_threshold": 5.0,
+      "rel_change_threshold": 2.5,
+      "baseline_zscore_threshold": 6.0,
+      "v_rms_gate": 0.2,
+      "ramp_ratio_threshold": 0.25,
+      "baseline_min_samples": 20,
+      "baseline_buffer_size": 50,
+      "spike_cooldown_samples": 20,
+      "ml_strong_fault_confidence": 0.75
+    }
   }
 }

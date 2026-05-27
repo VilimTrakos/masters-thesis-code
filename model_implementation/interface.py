@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Inferencija: voltage klasifikator + fault detektor + multi-strategija detekcija skokova.
+Prepoznavanje uzivo: klasifikator napona + detektor kvarova + viseslojno
+prepoznavanje naponskih skokova.
 
 Dva koraka:
   1. Voltage klasifikator -> predikcija napona + pouzdanost
@@ -26,12 +27,12 @@ class VoltageFaultPredictor:
     """
 
     def __init__(self, model_dir):
-        # ucitavanje konfiguracije voltage klasifikatora
+        # ucitavanje postavki klasifikatora napona
         putanja_modela = os.path.join(model_dir, 'model_config.json')
         with open(putanja_modela) as datoteka:
             self.voltage_cfg = json.load(datoteka)
 
-        # ucitavanje konfiguracije fault detektora
+        # ucitavanje postavki detektora kvarova
         putanja_kvara = os.path.join(model_dir, 'fault_config.json')
         with open(putanja_kvara) as datoteka:
             self.fault_cfg = json.load(datoteka)
@@ -63,6 +64,18 @@ class VoltageFaultPredictor:
         fault_model_path = os.path.join(model_dir, fault_model_file)
         self.fault_model = lgb.Booster(model_file=fault_model_path)
 
+        # radni pragovi detektora naponskih skokova (iz fault_config.json)
+        op = self.fault_cfg['spike_detection']['operational_thresholds']
+        self.spike_mad_zscore = float(op['mad_zscore_threshold'])
+        self.spike_rel_change = float(op['rel_change_threshold'])
+        self.spike_baseline_zscore = float(op['baseline_zscore_threshold'])
+        self.spike_v_rms_gate = float(op['v_rms_gate'])
+        self.spike_ramp_ratio = float(op['ramp_ratio_threshold'])
+        self.baseline_min_samples = int(op['baseline_min_samples'])
+        self.baseline_max_size = int(op['baseline_buffer_size'])
+        self.spike_cooldown_samples = int(op['spike_cooldown_samples'])
+        self.ml_strong_fault_conf = float(op['ml_strong_fault_confidence'])
+
         self.buffer = []
 
         # klizajuci spremnik osnove za detekciju skokova ovisnu o kontekstu.
@@ -70,7 +83,6 @@ class VoltageFaultPredictor:
         # odbaciti sama MAD detekcija pa nije problem ako su unutra spremljeni
         # i uzorci snimljeni tijekom skoka ili kvara.
         self.baseline_buffer = []
-        self.baseline_max_size = 50
 
         # pracenje resetiranja spremnika nakon skoka.
         # Nakon sto skok obrise spremnik, kratak cooldown sprjecava da se
@@ -198,14 +210,13 @@ class VoltageFaultPredictor:
         n_features = len(feature_indices)
 
         # ---- Strategija A: detekcija outliera unutar prozora preko MAD ----
-        # z-score prag 5.0, dovoljan udio glasova 0.5
         outlier_glasovi = np.zeros(window_np.shape[0], dtype=np.float32)
         for idx in feature_indices:
             stupac = window_np[:, idx].astype(np.float64)
             median_stupca = np.median(stupac)
             mad = np.median(np.abs(stupac - median_stupca)) + 1e-9
             mod_z = np.abs(stupac - median_stupca) / (1.4826 * mad)
-            outlier_glasovi += (mod_z > 5.0).astype(np.float32)
+            outlier_glasovi += (mod_z > self.spike_mad_zscore).astype(np.float32)
 
         prag_glasova = max(3, int(n_features * 0.5))
         outlier_maska = outlier_glasovi >= prag_glasova
@@ -216,7 +227,6 @@ class VoltageFaultPredictor:
         is_brief_outlier = (1 <= broj_outliera <= 2)
 
         # ---- Strategija B: detekcija iznenadnog multi-feature skoka ----
-        # prag relativne promjene 2.5 (>250%), dovoljan udio 0.5
         max_jump_features = 0
         jump_step = -1
         for t in range(1, window_np.shape[0]):
@@ -227,7 +237,7 @@ class VoltageFaultPredictor:
                 nazivnik = abs(v_prev) + 1e-6
                 if nazivnik > 1e-3:
                     rel_promjena = abs(v_curr - v_prev) / nazivnik
-                    if rel_promjena > 2.5:  # >250% relativne promjene
+                    if rel_promjena > self.spike_rel_change:
                         broj_skocenih_znacajki += 1
             if broj_skocenih_znacajki > max_jump_features:
                 max_jump_features = broj_skocenih_znacajki
@@ -236,12 +246,11 @@ class VoltageFaultPredictor:
         is_sudden_jump = max_jump_features >= max(4, int(n_features * 0.5))
 
         # ---- Strategija C: z-score prema klizajucoj osnovi (ako ima dovoljno povijesti) ----
-        # mod_z prag 6.0, dovoljan udio 0.6
         baseline_score = 0
         baseline_used = False
-        if len(self.baseline_buffer) >= 20:
+        if len(self.baseline_buffer) >= self.baseline_min_samples:
             baseline_used = True
-            osnova = np.array(self.baseline_buffer[-50:], dtype=np.float64)
+            osnova = np.array(self.baseline_buffer[-self.baseline_max_size:], dtype=np.float64)
             for idx in feature_indices:
                 vrijednosti_osnove = osnova[:, idx]
                 median_osnove = np.median(vrijednosti_osnove)
@@ -249,7 +258,7 @@ class VoltageFaultPredictor:
                 stupac_prozora = window_np[:, idx].astype(np.float64)
                 najveca_devijacija = stupac_prozora[np.argmax(np.abs(stupac_prozora - median_osnove))]
                 mod_z = abs(najveca_devijacija - median_osnove) / (1.4826 * mad_osnove)
-                if mod_z > 6.0:
+                if mod_z > self.spike_baseline_zscore:
                     baseline_score += 1
 
         is_baseline_outlier = baseline_used and baseline_score >= max(4, int(n_features * 0.6))
@@ -259,9 +268,9 @@ class VoltageFaultPredictor:
         polovica = window_np.shape[0] // 2
         prvi_median = float(np.median(v_rms_stupac[:polovica]))
         drugi_median = float(np.median(v_rms_stupac[polovica:]))
-        if prvi_median > 0.2 and drugi_median > 0.2:
+        if prvi_median > self.spike_v_rms_gate and drugi_median > self.spike_v_rms_gate:
             ramp_ratio = abs(drugi_median - prvi_median) / max(prvi_median, drugi_median)
-            is_v_rms_ramp = ramp_ratio > 0.25
+            is_v_rms_ramp = ramp_ratio > self.spike_ramp_ratio
         else:
             is_v_rms_ramp = False
 
@@ -281,7 +290,7 @@ class VoltageFaultPredictor:
             'jump_step': jump_step,
             'baseline_outlier_features': baseline_score,
             'baseline_used': baseline_used,
-            'v_rms_ramp_ratio': float(ramp_ratio) if prvi_median > 0.2 and drugi_median > 0.2 else 0.0,
+            'v_rms_ramp_ratio': float(ramp_ratio) if prvi_median > self.spike_v_rms_gate and drugi_median > self.spike_v_rms_gate else 0.0,
             'triggered': {
                 'brief_outlier': is_brief_outlier,
                 'sudden_jump': is_sudden_jump,
@@ -320,11 +329,12 @@ class VoltageFaultPredictor:
         is_spike, spike_conf, spike_detail = self._detect_voltage_spike(window_np)
 
         # Odluka:
-        # Ako ML predvida poznat kvar (movement/imbalance) s conf > 0.75,
-        # vjerujemo ML modelu - ima eksplicitne trening podatke za to.
+        # Ako ML predvida poznat kvar (movement/imbalance) s dovoljno visokom
+        # pouzdanoscu, vjerujemo ML modelu - ima eksplicitne trening podatke za to.
         # Inace, ako se okine detekcija skoka, oznaci kao voltage_spike.
         # Inace, koristi ML predikciju (najcesce 'normal').
-        ml_strong_fault = (ml_class in ('fan_imbalance', 'movement') and ml_conf > 0.75)
+        ml_strong_fault = (ml_class in ('fan_imbalance', 'movement') and
+                           ml_conf > self.ml_strong_fault_conf)
 
         if is_spike and not ml_strong_fault:
             fault_status = 'voltage_spike'
@@ -339,9 +349,7 @@ class VoltageFaultPredictor:
             'ml_class': ml_class,
             'ml_conf': ml_conf,
             'is_voltage_spike': is_spike,
-            'spike_confidence': float(spike_conf),
             'spike_detail': spike_detail,
-            'spike_overridden_by_ml': bool(is_spike and ml_strong_fault),
         }
 
         return voltage_class, voltage_conf, fault_status, fault_conf, detail
@@ -376,7 +384,8 @@ class VoltageFaultPredictor:
         # cistim post-tranzicijskim uzorcima. Cooldown sprjecava rekurzivno
         # brisanje - post-rebuffer Strategija C detekcije (stara osnova vs novi napon)
         # se prikazuju kao skokovi ali ne pokrecu ponovni reset.
-        if fault == 'voltage_spike' and (self._sample_count - self._last_spike_clear) > 20:
+        if (fault == 'voltage_spike' and
+                (self._sample_count - self._last_spike_clear) > self.spike_cooldown_samples):
             self.buffer = []
             self._last_spike_clear = self._sample_count
 
@@ -544,7 +553,7 @@ def run_live_test(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Voltage + fault inferencija')
+    parser = argparse.ArgumentParser(description='Prepoznavanje napona i kvarova uzivo')
     parser.add_argument('--model-dir', default=os.path.dirname(os.path.abspath(__file__)),
                         help='Putanja do model_implementation direktorija')
     parser.add_argument('--expected-voltage', type=str, default=None,
