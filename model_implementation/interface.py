@@ -462,7 +462,16 @@ def run_live_test(args):
     if args.replay:
         print(f"\nReplay iz {args.replay} ...")
         with open(args.replay) as datoteka:
-            zapisi = [json.loads(redak) for redak in datoteka]
+            # Bez JSONC podrške:
+            # zapisi = [json.loads(redak) for redak in datoteka]
+
+            zapisi = []
+            for redak in datoteka:
+                redak = redak.strip()
+                # preskoci prazne redove i //komentare (jsonc format)
+                if not redak or redak.startswith('//'):
+                    continue
+                zapisi.append(json.loads(redak))
 
         for i, zapis in enumerate(zapisi):
             if max_samples and brojaci['total'] >= max_samples:
